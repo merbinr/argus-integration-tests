@@ -1,0 +1,82 @@
+services:
+  catcher:
+    build:
+      context: ../catcher
+      dockerfile: ../catcher/Dockerfile
+    environment:
+      CATCHER_HTTP_WEBHOOK_TOKEN: ${CATCHER_HTTP_WEBHOOK_TOKEN}
+      CATCHER_OUTGOING_QUEUE_HOST: "catcher-outgoing-queue"
+      CATCHER_RABBITMQ_PASSWORD: ${CATCHER_RABBITMQ_PASSWORD}
+    depends_on:
+      catcher-outgoing-queue:
+        condition: service_healthy
+  
+  catcher-outgoing-queue:
+    image: rabbitmq:3
+    environment:
+      RABBITMQ_DEFAULT_USER: "rabbit"
+      RABBITMQ_DEFAULT_PASS: ${CATCHER_RABBITMQ_PASSWORD}
+    healthcheck:
+        test: "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q check_running"
+        interval: 5s
+        timeout: 15s
+        retries: 10
+  
+  deduplicator:
+    # image: ghcr.io/merbinr/deduplicator:main
+    build:
+      context: ../deduplicator
+      dockerfile: ../deduplicator/Dockerfile
+    depends_on:
+      catcher-outgoing-queue:
+        condition: service_healthy
+      deduplicator-outgoing-queue:
+        condition: service_healthy
+      redis_cache:
+        condition: service_healthy
+
+    environment:
+      DEDUPLICATOR_INCOMING_QUEUE_HOST: "catcher-outgoing-queue"
+      DEDUPLICATOR_OUTGOING_QUEUE_HOST: "deduplicator-outgoing-queue"
+      DEDUPLICATOR_REDIS_CACHE_HOST: "redis_cache"
+
+      DEDUPLICATOR_INCOMING_QUEUE_PASSWORD: ${CATCHER_RABBITMQ_PASSWORD}
+      DEDUPLICATOR_OUTGOING_QUEUE_PASSWORD: ${DEDUPLICATOR_OUTGOING_QUEUE_PASSWORD}
+      DEDUPLICATOR_REDIS_PASSWORD: ${DEDUPLICATOR_REDIS_PASSWORD}
+
+
+  deduplicator-outgoing-queue:
+    image: rabbitmq:3
+    environment:
+      RABBITMQ_DEFAULT_USER: "rabbit"
+      RABBITMQ_DEFAULT_PASS: ${DEDUPLICATOR_OUTGOING_QUEUE_PASSWORD}
+    healthcheck:
+        test: "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q check_running"
+        interval: 5s
+        timeout: 15s
+        retries: 10
+
+  redis_cache:
+    image: redis:6
+    environment:
+      REDIS_PASSWORD: ${DEDUPLICATOR_REDIS_PASSWORD}
+    healthcheck:
+      test: "redis-cli ping"
+      interval: 5s
+      timeout: 15s
+      retries: 10
+
+  integration-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      CATCHER_HTTP_WEBHOOK_TOKEN: ${CATCHER_HTTP_WEBHOOK_TOKEN}
+    depends_on:
+      redis_cache:
+        condition: service_healthy
+      deduplicator-outgoing-queue:
+        condition: service_healthy
+      catcher-outgoing-queue:
+        condition: service_healthy
+      
