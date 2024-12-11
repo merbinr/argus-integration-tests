@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import requests
 import pytest
@@ -23,42 +24,47 @@ SAMPLE_WEBHOOK_DATA = {
     }
 
 # RabbitMQ setup and arguments (Deduplicator output queue)
-RABBITMQ_HOST = "localhost"
+OUTGOING_RABBITMQ_HOST = "localhost"
 QUEUE_NAME = "logs"
 RABBITMQ_USERNAME = "rabbit"
 RABBITMQ_PASSWORD = "test"
 credentials = pika.PlainCredentials(RABBITMQ_USERNAME, RABBITMQ_PASSWORD)
 
+REDIS_HOST = "localhost"
+
 
 # Flush redis before each test
 def flush_redis():
-    r = redis.Redis(host='localhost', port=6379, db=0)
-    r.flushall()
+    redis_client = redis.StrictRedis(host=REDIS_HOST, port=6379, db=0)
+    redis_client.flushall()
 
 
 @pytest.fixture(scope="module")
 def rabbitmq_connection():
     """Fixture to set up and tear down RabbitMQ connection."""
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, 
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host=OUTGOING_RABBITMQ_HOST, 
                                                                    credentials=credentials))
     channel = connection.channel()
     channel.queue_declare(queue=QUEUE_NAME, durable=True)
 
     yield channel  # Provide the channel to tests
-    channel.queue_delete(queue=QUEUE_NAME)  # Clean up the queue
-    connection.close()
+
 
 def test_recive_data_from_deduplicator(rabbitmq_connection):
     """
     Send sample valid data to webhook and recieve it from output queue of deduplicator.
     """
+    time.sleep(1)
     channel : BlockingChannel = rabbitmq_connection
+    redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0)
+
     expected_message = json.loads(str('{"Cloud":"aws","Type":"vpc","Version":2,"AccountID":"783023365380","InterfaceID":"eni-00fe26c107412e170","SourceIP":"67.220.247.194","DestinationIP":"172.31.32.151","DestinationPort":443,"SourcePort":49782,"Protocol":6,"Packets":6,"Bytes":306,"StartTime":1732010760,"EndTime":1732010788,"Action":"ACCEPT","LogStatus":"OK"}'))
 
     # Purge the queue before sending the data
     channel.queue_purge(queue=QUEUE_NAME)
     # Purge the redis before sending the data
     flush_redis()
+    time.sleep(1)
 
     data = dict(SAMPLE_WEBHOOK_DATA)
     data['records'][0]['data'] = "eyJtZXNzYWdlIjoiMiA3ODMwMjMzNjUzODAgZW5pLTAwZmUyNmMxMDc0MTJlMTcwIDY3LjIyMC4yNDcuMTk0IDE3Mi4zMS4zMi4xNTEgNDQzIDQ5NzgyIDYgNiAzMDYgMTczMjAxMDc2MCAxNzMyMDEwNzg4IEFDQ0VQVCBPSyJ9Cg=="
@@ -68,30 +74,64 @@ def test_recive_data_from_deduplicator(rabbitmq_connection):
     assert res.status_code == 200
     assert res.json() == {"message": "success"}
 
+    time.sleep(1)
     messages = []
 
-    def callback(ch, method, properties, body):
-        messages.append(body)
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-    
-    channel.basic_consume(queue=QUEUE_NAME, on_message_callback=callback, auto_ack=False)
-    
-    tries = 0
+    retries = 0
 
-    while not messages:
-        tries += 1
-        channel.connection.process_data_events(time_limit=1)
+    while True:
+        method_frame, header_frame, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=True)
+        if method_frame:
+            messages.append(body.decode())
+            break
+        if retries > 5:
+            Exception("No message received from the queue.")
+        retries += 1
+        time.sleep(1)
 
-        if tries > 10:
-            raise Exception("No messages received from deduplicator")
-        time.sleep(1) # Wait for the message to be processed
-        
-        
-    
-    for message in messages:
-        print("Messages starting\n")
-        print(message)
-        print("Messages Ending\n")
 
-    assert expected_message == json.loads((messages[0].decode()))
-    
+    assert expected_message == json.loads(body.decode())
+    assert len(messages) == 1
+
+def test_able_to_remove_duplicate_entries(rabbitmq_connection):
+    """
+    Send sample valid data to webhook and recieve it from output queue of deduplicator.
+    """
+    channel : BlockingChannel = rabbitmq_connection
+    redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0)
+
+    # Purge the queue before sending the data
+    channel.queue_purge(queue=QUEUE_NAME)
+    # Purge the redis before sending the data
+    flush_redis()
+    time.sleep(1)
+
+
+    data = dict(SAMPLE_WEBHOOK_DATA)
+    records_data = [
+        {
+            "data" :  "eyJtZXNzYWdlIjoiMiA3ODMwMjMzNjUzODAgZW5pLTAwZmUyNmMxMDc0MTJlMTcwIDY3LjIyMC4yNDcuMTk0IDE3Mi4zMS4zMi4xNTEgNDQzIDQ5NzgyIDYgNiAzMDYgMTczMjAxMDc2MCAxNzMyMDEwNzg4IEFDQ0VQVCBPSyJ9Cg=="
+        },
+        {
+            "data" :  "eyJtZXNzYWdlIjoiMiA3ODMwMjMzNjUzODAgZW5pLTAwZmUyNmMxMDc0MTJlMTcwIDY3LjIyMC4yNDcuMTk0IDE3Mi4zMS4zMi4xNTEgNDQzIDQ5NzgyIDYgNiAzMDYgMTczMjAxMDc2MCAxNzMyMDEwNzg4IEFDQ0VQVCBPSyJ9Cg=="
+        }
+    ]
+    data['records'] = records_data
+
+
+
+    res = requests.post(url=WEBHOOK_URL, headers=WEBHOOK_HEADERS, json=data)
+    assert res.status_code == 200
+    assert res.json() == {"message": "success"}
+
+    messages = []
+    time.sleep(1)
+
+    for _ in range(2):
+        method_frame, header_frame, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=True)
+        if method_frame:
+            messages.append(body.decode())
+        else:
+            print("No more messages available in the queue.")
+            break
+    assert len(messages) == 1
